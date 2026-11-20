@@ -1,0 +1,153 @@
+name: Watch CFData-WEB and Build Image
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "强制构建并推送镜像"
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM_REPO: PoemMisty/CFData-WEB
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      ref_name: ${{ steps.check.outputs.ref_name }}
+      version_tag: ${{ steps.check.outputs.version_tag }}
+      is_release: ${{ steps.check.outputs.is_release }}
+
+    steps:
+      - name: Check upstream release or latest commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1. 尝试获取上游最新 Release
+          RELEASE_JSON=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" || true)
+
+          LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
+
+          # 2. 获取上游默认分支及最新 commit SHA
+          REPO_JSON=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
+            "https://api.github.com/repos/${UPSTREAM_REPO}")
+          DEFAULT_BRANCH=$(echo "$REPO_JSON" | jq -r '.default_branch // "main"')
+          LATEST_SHA=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/commits/${DEFAULT_BRANCH}" | jq -r '.sha')
+
+          if [ -n "$LATEST_TAG" ]; then
+            TARGET_REF="$LATEST_TAG"
+            VER_TAG="$LATEST_TAG"
+            IS_REL="true"
+            STATE_KEY="${LATEST_TAG}-${LATEST_SHA:0:7}"
+          else
+            TARGET_REF="$LATEST_SHA"
+            VER_TAG="sha-${LATEST_SHA:0:7}"
+            IS_REL="false"
+            STATE_KEY="$LATEST_SHA"
+          fi
+
+          # 3. 检查 GHCR 中是否已存在对应 tag 的包版本（简易幂等判断）
+          ALREADY_EXISTS="false"
+          if [ "${{ inputs.force_build }}" != "true" ] && [ -n "${GH_TOKEN:-}" ]; then
+            OWNER=$(echo "${IMAGE_NAME}" | cut -d'/' -f1)
+            PKG=$(echo "${IMAGE_NAME}" | cut -d'/' -f2)
+            # 若已有同名 tag，可通过 force_build 手动覆盖
+            if [ "$IS_REL" = "true" ]; then
+              TAGS_JSON=$(curl -fsSL \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/orgs/${OWNER}/packages/container/${PKG}/versions?per_page=20" 2>/dev/null || \
+                curl -fsSL \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/users/${OWNER}/packages/container/${PKG}/versions?per_page=20" 2>/dev/null || true)
+              if echo "$TAGS_JSON" | grep -q "\"${VER_TAG}\""; then
+                ALREADY_EXISTS="true"
+              fi
+            fi
+          fi
+
+          if [ "${{ inputs.force_build }}" = "true" ] || [ "$ALREADY_EXISTS" = "false" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "ref_name=${TARGET_REF}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${VER_TAG}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${IS_REL}" >> "$GITHUB_OUTPUT"
+          echo "Detected upstream ref: ${TARGET_REF} (tag=${VER_TAG}, state=${STATE_KEY})"
+
+      - name: Checkout upstream source
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.check.outputs.ref_name }}
+          path: upstream
+
+      - name: Copy custom Dockerfile if present in current repo
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          path: self-repo
+
+      - name: Prepare build context
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          if [ -f self-repo/Dockerfile ]; then
+            cp self-repo/Dockerfile upstream/Dockerfile
+          fi
+
+      - name: Set up QEMU
+        if: steps.check.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.check.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.check.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.check.outputs.version_tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.check.outputs.version_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
