@@ -36,7 +36,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1. 尝试获取上游最新 Release
           RELEASE_JSON=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
@@ -44,7 +43,6 @@ jobs:
 
           LATEST_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
 
-          # 2. 获取上游默认分支及最新 commit SHA
           REPO_JSON=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
@@ -67,12 +65,10 @@ jobs:
             STATE_KEY="$LATEST_SHA"
           fi
 
-          # 3. 检查 GHCR 中是否已存在对应 tag 的包版本（简易幂等判断）
           ALREADY_EXISTS="false"
           if [ "${{ inputs.force_build }}" != "true" ] && [ -n "${GH_TOKEN:-}" ]; then
             OWNER=$(echo "${IMAGE_NAME}" | cut -d'/' -f1)
             PKG=$(echo "${IMAGE_NAME}" | cut -d'/' -f2)
-            # 若已有同名 tag，可通过 force_build 手动覆盖
             if [ "$IS_REL" = "true" ]; then
               TAGS_JSON=$(curl -fsSL \
                 -H "Accept: application/vnd.github+json" \
@@ -107,7 +103,7 @@ jobs:
           ref: ${{ steps.check.outputs.ref_name }}
           path: upstream
 
-      - name: Copy custom Dockerfile if present in current repo
+      - name: Checkout self repo for Dockerfile
         if: steps.check.outputs.should_build == 'true'
         uses: actions/checkout@v4
         with:
@@ -116,9 +112,8 @@ jobs:
       - name: Prepare build context
         if: steps.check.outputs.should_build == 'true'
         run: |
-          if [ -f self-repo/Dockerfile ]; then
-            cp self-repo/Dockerfile upstream/Dockerfile
-          fi
+          test -f self-repo/Dockerfile
+          cp self-repo/Dockerfile upstream/Dockerfile
 
       - name: Set up QEMU
         if: steps.check.outputs.should_build == 'true'
